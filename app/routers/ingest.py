@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import tuple_
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import RawRecord, get_db
@@ -16,12 +16,20 @@ def ingest_stocks(records: list[RawStockPrice], db: Session = Depends(get_db)):
     duplicates = 0
 
     incoming_keys = {(r.ticker.upper(), r.trade_date) for r in records}
-    existing_rows = (
-        db.query(RawRecord)
-        .filter(tuple_(RawRecord.ticker, RawRecord.trade_date).in_(list(incoming_keys)))
-        .all()
-    )
-    existing = {(r.ticker, r.trade_date) for r in existing_rows}
+    incoming_tickers = {k[0] for k in incoming_keys}
+    incoming_dates = {k[1] for k in incoming_keys}
+    if incoming_tickers and incoming_dates:
+        existing_rows = db.execute(
+            select(RawRecord.ticker, RawRecord.trade_date).where(
+                RawRecord.ticker.in_(incoming_tickers),
+                RawRecord.trade_date.in_(incoming_dates),
+            )
+        ).all()
+        existing = {(r[0], r[1]) for r in existing_rows}
+    else:
+        existing = set()
+
+    to_insert: list[RawRecord] = []
 
     for record in records:
         key = (record.ticker.upper(), record.trade_date)
@@ -29,7 +37,7 @@ def ingest_stocks(records: list[RawStockPrice], db: Session = Depends(get_db)):
             duplicates += 1
             continue
 
-        db.add(
+        to_insert.append(
             RawRecord(
                 ticker=key[0],
                 open_price=record.open_price,
@@ -42,6 +50,8 @@ def ingest_stocks(records: list[RawStockPrice], db: Session = Depends(get_db)):
         existing.add(key)
         added += 1
 
+    if to_insert:
+        db.bulk_save_objects(to_insert)
     db.commit()
 
     return {

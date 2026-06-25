@@ -1,0 +1,110 @@
+trigger:
+  branches:
+    include:
+      - main
+      - master
+
+pr:
+  branches:
+    include:
+      - main
+      - master
+
+variables:
+  pythonVersion: '3.12'
+  imageRepository: 'fastapi-de-pipeline'
+  dockerfilePath: '$(Build.SourcesDirectory)/Dockerfile'
+  tag: '$(Build.BuildId)'
+
+stages:
+  - stage: CI
+    displayName: CI Stage
+    jobs:
+      - job: LintTestSastBuild
+        displayName: Lint, Test, SAST, Build
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(pythonVersion)'
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+              pip install bandit
+            displayName: Install dependencies
+
+          - script: |
+              ruff check .
+            displayName: Lint
+
+          - script: |
+              bandit -r app -f txt -lll
+            displayName: SAST (Bandit)
+
+          - script: |
+              pytest -q
+            displayName: Run tests
+            env:
+              DATABASE_URL: sqlite:///./pipeline_ci.db
+              PIPELINE_API_KEY: change-me
+
+          - task: Docker@2
+            displayName: Build and push image to ACR
+            inputs:
+              command: buildAndPush
+              repository: $(imageRepository)
+              dockerfile: $(dockerfilePath)
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(tag)
+                latest
+
+  - stage: CD
+    displayName: CD Stage
+    dependsOn: CI
+    condition: and(succeeded(), or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/master')))
+    jobs:
+      - deployment: DeployWebApp
+        displayName: Deploy to Azure Web App (Container)
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureWebAppContainer@1
+                  displayName: Deploy container image
+                  inputs:
+                    azureSubscription: $(azureSubscriptionServiceConnection)
+                    appName: $(webAppName)
+                    containers: |
+                      $(acrLoginServer)/$(imageRepository):$(tag)
+
+                - task: AzureAppServiceSettings@1
+                  displayName: Configure app settings
+                  inputs:
+                    azureSubscription: $(azureSubscriptionServiceConnection)
+                    appName: $(webAppName)
+                    appSettings: |
+                      [
+                        {
+                          "name": "WEBSITES_PORT",
+                          "value": "8000",
+                          "slotSetting": false
+                        },
+                        {
+                          "name": "DATABASE_URL",
+                          "value": "$(DATABASE_URL)",
+                          "slotSetting": false
+                        },
+                        {
+                          "name": "PIPELINE_API_KEY",
+                          "value": "$(PIPELINE_API_KEY)",
+                          "slotSetting": true
+                        }
+                      ]

@@ -68,3 +68,27 @@ def test_forbidden_without_api_key():
     client.post("/ingest/sample/stocks?days=1")
     response = client.post("/pipeline/run/bronze")
     assert response.status_code == 403
+
+
+def test_incremental_full_pipeline_first_run_processes_records():
+    client.post("/ingest/sample/stocks?days=2")
+    response = client.post("/pipeline/run/full/incremental", headers=AUTH_HEADERS)
+    assert response.status_code == 200
+
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["stages"][0]["records_out"] > 0
+
+
+def test_incremental_full_pipeline_second_run_is_noop():
+    client.post("/ingest/sample/stocks?days=2")
+    first = client.post("/pipeline/run/full/incremental", headers=AUTH_HEADERS)
+    assert first.status_code == 200
+
+    second = client.post("/pipeline/run/full/incremental", headers=AUTH_HEADERS)
+    assert second.status_code == 200
+
+    payload = second.json()
+    assert payload["stages"][0]["records_in"] == 0
+    assert payload["stages"][1]["records_in"] == 0
+    assert payload["stages"][2]["records_in"] == 0
