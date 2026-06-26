@@ -2,6 +2,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from app.config import settings
+from app.services.dq_service import bronze_default_rules, evaluate_rules
+
 _NULL_SENTINELS = {"none", "null", "n/a", "na", "nan", "", "-"}
 
 
@@ -78,32 +81,17 @@ def transform_raw_to_bronze_stock(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_bronze_dq_checks(records: list[dict[str, Any]], table: str) -> list[dict[str, Any]]:
-    if not records:
-        return []
+    rules = bronze_default_rules()
+    predicates = {
+        "validity_rate": lambda value: value >= settings.dq_bronze_validity_threshold,
+        "null_close_price_rate": lambda value: value <= settings.dq_bronze_null_close_threshold,
+    }
+    results = evaluate_rules(records, table, rules, predicates)
 
-    total = len(records)
-    valid_count = sum(1 for r in records if r.get("is_valid"))
-    null_close = sum(1 for r in records if r.get("close_price") is None)
-    now = datetime.now(timezone.utc).isoformat()
-
-    checks = [
-        {
-            "check_name": "validity_rate",
-            "layer": "bronze",
-            "table": table,
-            "passed": (valid_count / total) >= 0.8,
-            "actual": round(valid_count / total, 4),
-            "threshold": ">= 0.80",
-            "checked_at": now,
-        },
-        {
-            "check_name": "null_close_price_rate",
-            "layer": "bronze",
-            "table": table,
-            "passed": (null_close / total) <= 0.2,
-            "actual": round(null_close / total, 4),
-            "threshold": "<= 0.20",
-            "checked_at": now,
-        },
-    ]
-    return checks
+    # Attach explicit threshold labels after config resolution for observability.
+    for result in results:
+        if result["check_name"] == "validity_rate":
+            result["threshold"] = f">= {settings.dq_bronze_validity_threshold:.2f}"
+        elif result["check_name"] == "null_close_price_rate":
+            result["threshold"] = f"<= {settings.dq_bronze_null_close_threshold:.2f}"
+    return results

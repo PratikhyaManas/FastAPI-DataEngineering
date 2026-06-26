@@ -301,36 +301,42 @@ def _run_bronze_stage_incremental(db: Session) -> dict:
         for row in raw_rows
     ]
 
-    existing_keys = {
-        (r.ticker, r.trade_date)
-        for r in db.query(BronzeRecord.ticker, BronzeRecord.trade_date)
+    existing_by_key = {
+        (r.ticker, r.trade_date): r
+        for r in db.query(BronzeRecord)
         .filter(BronzeRecord.ticker.isnot(None), BronzeRecord.trade_date.isnot(None))
         .all()
     }
 
-    new_bronze_models: list[BronzeRecord] = []
+    upserted_count = 0
     for r in bronze:
         td = datetime.fromisoformat(r["trade_date"]).date() if r["trade_date"] else None
         key = (r["ticker"], td)
-        if key in existing_keys:
-            continue
-        existing_keys.add(key)
-        new_bronze_models.append(
-            BronzeRecord(
-                record_id=r["record_id"],
-                ticker=r["ticker"],
-                open_price=r["open_price"],
-                close_price=r["close_price"],
-                volume=r["volume"],
-                trade_date=td,
-                ingested_at=datetime.fromisoformat(r["ingested_at"]),
-                is_valid=bool(r["is_valid"]),
-                error_reason=r["error_reason"],
+        existing = existing_by_key.get(key)
+        if existing is None:
+            db.add(
+                BronzeRecord(
+                    record_id=r["record_id"],
+                    ticker=r["ticker"],
+                    open_price=r["open_price"],
+                    close_price=r["close_price"],
+                    volume=r["volume"],
+                    trade_date=td,
+                    ingested_at=datetime.fromisoformat(r["ingested_at"]),
+                    is_valid=bool(r["is_valid"]),
+                    error_reason=r["error_reason"],
+                )
             )
-        )
+            upserted_count += 1
+            continue
 
-    if new_bronze_models:
-        db.bulk_save_objects(new_bronze_models)
+        existing.open_price = r["open_price"]
+        existing.close_price = r["close_price"]
+        existing.volume = r["volume"]
+        existing.ingested_at = datetime.fromisoformat(r["ingested_at"])
+        existing.is_valid = bool(r["is_valid"])
+        existing.error_reason = r["error_reason"]
+        upserted_count += 1
 
     dq_checks = bronze_service.run_bronze_dq_checks(bronze, "bronze_stock_prices_incremental")
     if dq_checks:
@@ -363,7 +369,7 @@ def _run_bronze_stage_incremental(db: Session) -> dict:
         "stage": "raw_to_bronze_incremental",
         "status": "success",
         "records_in": len(raw_rows),
-        "records_out": len(new_bronze_models),
+        "records_out": upserted_count,
         "records_valid": valid,
         "records_invalid": invalid,
         "duration_ms": round((time.perf_counter() - start) * 1000, 2),
@@ -397,11 +403,13 @@ def _run_silver_stage_incremental(db: Session) -> dict:
             "message": "No new bronze records since watermark.",
         }
 
-    existing_ids = {rid for (rid,) in db.query(SilverRecord.source_record_id).all()}
+    existing_by_source = {
+        rec.source_record_id: rec
+        for rec in db.query(SilverRecord).all()
+    }
     transformed = []
+    upserted = 0
     for rec in bronze_rows:
-        if rec.record_id in existing_ids:
-            continue
         out = silver_service.transform_bronze_to_silver_stock(
             {
                 "record_id": rec.record_id,
@@ -415,26 +423,38 @@ def _run_silver_stage_incremental(db: Session) -> dict:
         )
         if out is not None:
             transformed.append(out)
+            existing = existing_by_source.get(out["source_record_id"])
+            if existing is None:
+                db.add(
+                    SilverRecord(
+                        record_id=out["record_id"],
+                        source_record_id=out["source_record_id"],
+                        ticker=out["ticker"],
+                        trade_date=datetime.fromisoformat(out["trade_date"]).date(),
+                        open_price=float(out["open_price"]),
+                        close_price=float(out["close_price"]),
+                        volume=int(out["volume"]),
+                        daily_return_pct=out["daily_return_pct"],
+                        vwap_estimate=out["vwap_estimate"],
+                        is_bullish=bool(out["is_bullish"]),
+                        volume_category=out["volume_category"],
+                        processed_at=datetime.fromisoformat(out["processed_at"]),
+                    )
+                )
+                upserted += 1
+                continue
 
-    silver_models = [
-        SilverRecord(
-            record_id=r["record_id"],
-            source_record_id=r["source_record_id"],
-            ticker=r["ticker"],
-            trade_date=datetime.fromisoformat(r["trade_date"]).date(),
-            open_price=float(r["open_price"]),
-            close_price=float(r["close_price"]),
-            volume=int(r["volume"]),
-            daily_return_pct=r["daily_return_pct"],
-            vwap_estimate=r["vwap_estimate"],
-            is_bullish=bool(r["is_bullish"]),
-            volume_category=r["volume_category"],
-            processed_at=datetime.fromisoformat(r["processed_at"]),
-        )
-        for r in transformed
-    ]
-    if silver_models:
-        db.bulk_save_objects(silver_models)
+            existing.ticker = out["ticker"]
+            existing.trade_date = datetime.fromisoformat(out["trade_date"]).date()
+            existing.open_price = float(out["open_price"])
+            existing.close_price = float(out["close_price"])
+            existing.volume = int(out["volume"])
+            existing.daily_return_pct = out["daily_return_pct"]
+            existing.vwap_estimate = out["vwap_estimate"]
+            existing.is_bullish = bool(out["is_bullish"])
+            existing.volume_category = out["volume_category"]
+            existing.processed_at = datetime.fromisoformat(out["processed_at"])
+            upserted += 1
 
     now = datetime.now(timezone.utc)
     max_ingested = max((row.ingested_at for row in bronze_rows), default=now)
@@ -448,7 +468,7 @@ def _run_silver_stage_incremental(db: Session) -> dict:
         "stage": "bronze_to_silver_incremental",
         "status": "success",
         "records_in": len(bronze_rows),
-        "records_out": len(transformed),
+        "records_out": upserted,
         "duration_ms": round((time.perf_counter() - start) * 1000, 2),
     }
 
@@ -479,6 +499,16 @@ def _run_gold_stage_incremental(db: Session) -> dict:
             "message": "No new silver records since watermark.",
         }
 
+    impacted_keys = {(r.ticker, r.trade_date) for r in silver_rows}
+    all_for_impacted = (
+        db.query(SilverRecord)
+        .filter(
+            SilverRecord.ticker.in_([k[0] for k in impacted_keys]),
+            SilverRecord.trade_date.in_([k[1] for k in impacted_keys]),
+        )
+        .all()
+    )
+
     silver_payload = [
         {
             "record_id": r.record_id,
@@ -494,44 +524,51 @@ def _run_gold_stage_incremental(db: Session) -> dict:
             "volume_category": r.volume_category,
             "processed_at": r.processed_at.isoformat(),
         }
-        for r in silver_rows
+        for r in all_for_impacted
+        if (r.ticker, r.trade_date) in impacted_keys
     ]
     gold_rows = gold_service.aggregate_silver_to_gold(silver_payload)
 
-    existing_keys = {
-        (r.ticker, r.trade_date)
-        for r in db.query(GoldRecord.ticker, GoldRecord.trade_date)
-        .all()
+    existing_gold = {
+        (r.ticker, r.trade_date): r
+        for r in db.query(GoldRecord).all()
     }
-    new_gold_models: list[GoldRecord] = []
+    upserted = 0
     for r in gold_rows:
         trade_date = datetime.fromisoformat(r["trade_date"]).date()
         key = (r["ticker"], trade_date)
-        if key in existing_keys:
-            continue
-        existing_keys.add(key)
-        new_gold_models.append(
-            GoldRecord(
-                record_id=r["record_id"],
-                ticker=r["ticker"],
-                trade_date=trade_date,
-                avg_close_price=float(r["avg_close_price"]),
-                avg_daily_return_pct=r["avg_daily_return_pct"],
-                total_volume=int(r["total_volume"]),
-                bullish_days=int(r["bullish_days"]),
-                bearish_days=int(r["bearish_days"]),
-                source_count=int(r["source_count"]),
-                processed_at=datetime.fromisoformat(r["processed_at"]),
+        existing = existing_gold.get(key)
+        if existing is None:
+            db.add(
+                GoldRecord(
+                    record_id=r["record_id"],
+                    ticker=r["ticker"],
+                    trade_date=trade_date,
+                    avg_close_price=float(r["avg_close_price"]),
+                    avg_daily_return_pct=r["avg_daily_return_pct"],
+                    total_volume=int(r["total_volume"]),
+                    bullish_days=int(r["bullish_days"]),
+                    bearish_days=int(r["bearish_days"]),
+                    source_count=int(r["source_count"]),
+                    processed_at=datetime.fromisoformat(r["processed_at"]),
+                )
             )
-        )
+            upserted += 1
+            continue
 
-    if new_gold_models:
-        db.bulk_save_objects(new_gold_models)
+        existing.avg_close_price = float(r["avg_close_price"])
+        existing.avg_daily_return_pct = r["avg_daily_return_pct"]
+        existing.total_volume = int(r["total_volume"])
+        existing.bullish_days = int(r["bullish_days"])
+        existing.bearish_days = int(r["bearish_days"])
+        existing.source_count = int(r["source_count"])
+        existing.processed_at = datetime.fromisoformat(r["processed_at"])
+        upserted += 1
 
     now = datetime.now(timezone.utc)
     max_processed = max((row.processed_at for row in silver_rows), default=now)
     state.last_processed_at = now
-    state.records_processed += len(new_gold_models)
+    state.records_processed += upserted
     state.watermark = max_processed
     state.status = "idle"
     db.commit()
@@ -540,7 +577,7 @@ def _run_gold_stage_incremental(db: Session) -> dict:
         "stage": "silver_to_gold_incremental",
         "status": "success",
         "records_in": len(silver_rows),
-        "records_out": len(new_gold_models),
+        "records_out": upserted,
         "duration_ms": round((time.perf_counter() - start) * 1000, 2),
     }
 

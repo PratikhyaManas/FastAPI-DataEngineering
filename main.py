@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.database import SessionLocal, init_db, init_pipeline_state
 from app.logging_config import logger
-from app.routers import bronze, export, gold, health, ingest, pipeline, silver
+from app.routers import auth, bronze, export, gold, health, ingest, pipeline, silver
 
 
 @asynccontextmanager
@@ -61,6 +61,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 
 app.include_router(health.router, prefix="/health", tags=["Health"])
+app.include_router(auth.router, prefix="/auth", tags=["Auth"])
 app.include_router(ingest.router, prefix="/ingest", tags=["Ingestion"])
 app.include_router(pipeline.router, prefix="/pipeline", tags=["Pipeline"])
 app.include_router(bronze.router, prefix="/bronze", tags=["Bronze"])

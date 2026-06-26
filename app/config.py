@@ -9,6 +9,12 @@ class Settings(BaseSettings):
     output_dir: str = "output"
     database_url: str = "sqlite:///./pipeline.db"
     pipeline_api_key: str = "change-me"
+    jwt_secret_key: str = "change-this-jwt-secret"
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60
+
+    dq_bronze_validity_threshold: float = 0.80
+    dq_bronze_null_close_threshold: float = 0.20
 
 
 settings = Settings()

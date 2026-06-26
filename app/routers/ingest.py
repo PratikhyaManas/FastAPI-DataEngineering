@@ -14,26 +14,34 @@ router = APIRouter()
 def ingest_stocks(records: list[RawStockPrice], db: Session = Depends(get_db)):
     added = 0
     duplicates = 0
+    updated = 0
 
     incoming_keys = {(r.ticker.upper(), r.trade_date) for r in records}
     incoming_tickers = {k[0] for k in incoming_keys}
     incoming_dates = {k[1] for k in incoming_keys}
     if incoming_tickers and incoming_dates:
         existing_rows = db.execute(
-            select(RawRecord.ticker, RawRecord.trade_date).where(
+            select(RawRecord).where(
                 RawRecord.ticker.in_(incoming_tickers),
                 RawRecord.trade_date.in_(incoming_dates),
             )
-        ).all()
-        existing = {(r[0], r[1]) for r in existing_rows}
+        ).scalars().all()
+        existing_map = {(r.ticker, r.trade_date): r for r in existing_rows}
     else:
-        existing = set()
+        existing_map = {}
 
     to_insert: list[RawRecord] = []
 
     for record in records:
         key = (record.ticker.upper(), record.trade_date)
-        if key in existing:
+        existing = existing_map.get(key)
+        if existing is not None:
+            # Late corrections should advance received_at to be picked by incremental watermarks.
+            existing.open_price = record.open_price
+            existing.close_price = record.close_price
+            existing.volume = record.volume
+            existing.received_at = datetime.now(timezone.utc)
+            updated += 1
             duplicates += 1
             continue
 
@@ -47,7 +55,7 @@ def ingest_stocks(records: list[RawStockPrice], db: Session = Depends(get_db)):
                 received_at=datetime.now(timezone.utc),
             )
         )
-        existing.add(key)
+        existing_map[key] = to_insert[-1]
         added += 1
 
     if to_insert:
@@ -57,6 +65,7 @@ def ingest_stocks(records: list[RawStockPrice], db: Session = Depends(get_db)):
     return {
         "records_received": len(records),
         "records_added": added,
+        "records_updated": updated,
         "duplicates_skipped": duplicates,
     }
 
